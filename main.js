@@ -2,9 +2,16 @@ import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
-const GRAVITY = 18;
-const AIR_DAMPING = 0.995;
+const GRAVITY = 9.8;
+const AIR_DAMPING = 0.998;
 const GROUND_Y = 0;
+const MAX_ARM_LENGTH = 1.5;
+const HAND_RADIUS = 0.06;
+const HEAD_RADIUS = 0.15;
+const VELOCITY_HISTORY_SIZE = 8;
+const VELOCITY_LIMIT = 0.03;
+const JUMP_MULTIPLIER = 1.1;
+const MAX_JUMP_SPEED = 14;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9fd1ff);
@@ -39,11 +46,14 @@ rig.position.set(0, GROUND_Y, 5);
 rig.add(camera);
 scene.add(rig);
 
+const collidables = [];
+
 const groundMat = new THREE.MeshStandardMaterial({ color: 0x3d7a3d, roughness: 0.9 });
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), groundMat);
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
+collidables.push(ground);
 
 function addBlock(x, y, z, sx, sy, sz, color) {
   const block = new THREE.Mesh(
@@ -54,6 +64,7 @@ function addBlock(x, y, z, sx, sy, sz, color) {
   block.castShadow = true;
   block.receiveShadow = true;
   scene.add(block);
+  collidables.push(block);
   return block;
 }
 
@@ -70,6 +81,7 @@ for (let i = 0; i < 6; i++) {
   bar.position.set(-8 + i * 2, 4 + Math.sin(i) * 0.6, -1);
   bar.castShadow = true;
   scene.add(bar);
+  collidables.push(bar);
 }
 
 const controllerModelFactory = new XRControllerModelFactory();
@@ -83,7 +95,7 @@ function buildController(index) {
   rig.add(grip);
 
   const handMarker = new THREE.Mesh(
-    new THREE.SphereGeometry(0.04, 12, 12),
+    new THREE.SphereGeometry(HAND_RADIUS, 12, 12),
     new THREE.MeshStandardMaterial({ color: 0x222222, emissive: 0x000000 })
   );
   controller.add(handMarker);
@@ -95,69 +107,126 @@ function buildController(index) {
 const controller1 = buildController(0);
 const controller2 = buildController(1);
 
-const controllersState = [
-  { grabbing: false, prevPos: new THREE.Vector3() },
-  { grabbing: false, prevPos: new THREE.Vector3() }
+function setHandColor(controller, touching) {
+  controller.userData.marker.material.color.set(touching ? 0x4dff88 : 0x222222);
+  controller.userData.marker.material.emissive.set(touching ? 0x1c6b3a : 0x000000);
+}
+
+const handStates = [
+  { lastPos: new THREE.Vector3(), touching: false },
+  { lastPos: new THREE.Vector3(), touching: false }
 ];
 
-function setGrabColor(controller, grabbing) {
-  controller.userData.marker.material.color.set(grabbing ? 0x4dff88 : 0x222222);
-  controller.userData.marker.material.emissive.set(grabbing ? 0x1c6b3a : 0x000000);
-}
+let handsInitialized = false;
 
-function onSqueezeStart(index) {
-  const controller = index === 0 ? controller1 : controller2;
-  controllersState[index].grabbing = true;
-  controller.getWorldPosition(controllersState[index].prevPos);
-  setGrabColor(controller, true);
-}
+const raycaster = new THREE.Raycaster();
+const freeVelocity = new THREE.Vector3();
+const velocityHistory = new Array(VELOCITY_HISTORY_SIZE).fill(0).map(() => new THREE.Vector3());
+let velocityIndex = 0;
 
-function onSqueezeEnd(index) {
-  const controller = index === 0 ? controller1 : controller2;
-  controllersState[index].grabbing = false;
-  setGrabColor(controller, false);
-}
-
-controller1.addEventListener('squeezestart', () => onSqueezeStart(0));
-controller1.addEventListener('squeezeend', () => onSqueezeEnd(0));
-controller2.addEventListener('squeezestart', () => onSqueezeStart(1));
-controller2.addEventListener('squeezeend', () => onSqueezeEnd(1));
-
-const velocity = new THREE.Vector3();
 const clock = new THREE.Clock();
-const tmpPos = new THREE.Vector3();
-const tmpDelta = new THREE.Vector3();
+
+function clampToArmLength(headPos, rawPos) {
+  const offset = rawPos.clone().sub(headPos);
+  const dist = offset.length();
+  if (dist <= MAX_ARM_LENGTH) return rawPos.clone();
+  return headPos.clone().add(offset.normalize().multiplyScalar(MAX_ARM_LENGTH));
+}
+
+function probeTouching(fromPos, toPos) {
+  const travel = toPos.clone().sub(fromPos);
+  const travelLength = travel.length();
+  if (travelLength < 1e-5) return null;
+  raycaster.set(fromPos, travel.normalize());
+  raycaster.far = travelLength + HAND_RADIUS;
+  const hits = raycaster.intersectObjects(collidables, false);
+  if (hits.length > 0 && hits[0].distance <= travelLength + HAND_RADIUS) return hits[0];
+  return null;
+}
 
 function updateLocomotion(dt) {
   if (dt <= 0) return;
 
-  let anyGrabbing = false;
+  const headPos = new THREE.Vector3();
+  camera.getWorldPosition(headPos);
+
   const controllers = [controller1, controller2];
+  const rawPositions = controllers.map(() => new THREE.Vector3());
+  controllers.forEach((c, i) => c.getWorldPosition(rawPositions[i]));
+  const targetPositions = rawPositions.map((p) => clampToArmLength(headPos, p));
+
+  if (!handsInitialized) {
+    handStates[0].lastPos.copy(targetPositions[0]);
+    handStates[1].lastPos.copy(targetPositions[1]);
+    handsInitialized = true;
+  }
+
+  const gravityAssist = new THREE.Vector3(0, -2 * GRAVITY * dt * dt, 0);
+  const results = [];
 
   controllers.forEach((controller, i) => {
-    const state = controllersState[i];
-    if (!state.grabbing) return;
-    anyGrabbing = true;
-
-    controller.getWorldPosition(tmpPos);
-    tmpDelta.copy(tmpPos).sub(state.prevPos);
-
-    rig.position.sub(tmpDelta);
-
-    velocity.copy(tmpDelta).multiplyScalar(-1 / dt);
-
-    controller.getWorldPosition(state.prevPos);
+    const state = handStates[i];
+    const probeTarget = targetPositions[i].clone().add(gravityAssist);
+    const hit = probeTouching(state.lastPos, probeTarget);
+    const touching = hit ? true : state.touching && targetPositions[i].distanceTo(state.lastPos) < 1e-5;
+    const delta = touching ? state.lastPos.clone().sub(targetPositions[i]) : new THREE.Vector3();
+    results.push({ touching, delta });
   });
 
-  if (!anyGrabbing) {
-    velocity.y -= GRAVITY * dt;
-    rig.position.addScaledVector(velocity, dt);
-    velocity.multiplyScalar(AIR_DAMPING);
+  const bothTouching = results[0].touching && results[1].touching;
+  const bodyMovement = new THREE.Vector3();
+  if (bothTouching) {
+    bodyMovement.addVectors(results[0].delta, results[1].delta).multiplyScalar(0.5);
+  } else {
+    bodyMovement.add(results[0].delta).add(results[1].delta);
+  }
+
+  if (bodyMovement.lengthSq() > 1e-8) {
+    const dir = bodyMovement.clone().normalize();
+    raycaster.set(headPos, dir);
+    raycaster.far = bodyMovement.length() + HEAD_RADIUS;
+    const headHits = raycaster.intersectObjects(collidables, false);
+    if (headHits.length > 0 && headHits[0].distance < bodyMovement.length() + HEAD_RADIUS) {
+      const safeDist = Math.max(0, headHits[0].distance - HEAD_RADIUS);
+      bodyMovement.copy(dir).multiplyScalar(safeDist);
+    }
+  }
+
+  rig.position.add(bodyMovement);
+
+  controllers.forEach((controller, i) => {
+    const state = handStates[i];
+    const worldPos = new THREE.Vector3();
+    controller.getWorldPosition(worldPos);
+    state.lastPos.copy(worldPos);
+    state.touching = results[i].touching;
+    setHandColor(controller, results[i].touching);
+  });
+
+  velocityHistory[velocityIndex].copy(bodyMovement).divideScalar(dt);
+  velocityIndex = (velocityIndex + 1) % VELOCITY_HISTORY_SIZE;
+  const avgVelocity = new THREE.Vector3();
+  velocityHistory.forEach((v) => avgVelocity.add(v));
+  avgVelocity.divideScalar(VELOCITY_HISTORY_SIZE);
+
+  const anyTouching = results[0].touching || results[1].touching;
+
+  if (anyTouching) {
+    if (avgVelocity.length() > VELOCITY_LIMIT) {
+      const speed = Math.min(avgVelocity.length() * JUMP_MULTIPLIER, MAX_JUMP_SPEED);
+      freeVelocity.copy(avgVelocity).normalize().multiplyScalar(speed);
+    } else {
+      freeVelocity.set(0, 0, 0);
+    }
+  } else {
+    freeVelocity.y -= GRAVITY * dt;
+    rig.position.addScaledVector(freeVelocity, dt);
+    freeVelocity.multiplyScalar(AIR_DAMPING);
   }
 
   if (rig.position.y < GROUND_Y) {
     rig.position.y = GROUND_Y;
-    velocity.set(0, 0, 0);
+    freeVelocity.set(0, 0, 0);
   }
 }
 
